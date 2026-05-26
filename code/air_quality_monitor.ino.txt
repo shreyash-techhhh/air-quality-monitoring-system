@@ -1,0 +1,211 @@
+//Update Blynk Credentials
+#define BLYNK_TEMPLATE_ID "YOUR_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "Air Quality"
+#define BLYNK_AUTH_TOKEN "YOUR_AUTH_TOKEN"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h>
+
+// ================= WIFI =================(add credentials)
+char ssid[] = "Wifi Name (with "")";
+char pass[] = "Wifi password (with "")";
+
+// ================= PINS =================
+#define DHT_PIN 4
+#define MQ135_PIN 36
+#define MQ2_PIN 39
+#define BUZZER_PIN 18
+#define LED_RED 17
+#define LED_GREEN 16
+
+// ================= SENSORS =================
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ================= THRESHOLDS =================
+#define TEMP_THRESHOLD 40      // Temperature limit (°C)
+#define MQ135_THRESHOLD 1500   // Air quality limit
+#define MQ2_THRESHOLD 4000     // Gas detection limit
+
+// ================= SYSTEM STATES =================
+bool alertActive = false;     // alert currently ON
+bool acknowledged = false;   // user ne ACK kiya hai
+bool systemArmed = true;     // naya alert allow hai ya nahi
+bool wifiConnected = false;
+
+String cause = "Safe";
+String lastAlertCause = "Safe";
+
+void updateCauseLabel(const String &text) {
+  cause = text;
+  if (wifiConnected) {
+    Blynk.virtualWrite(V6, text);
+  }
+}
+
+void updateStatusLeds() {
+  if (!wifiConnected) return;
+  if (alertActive) {
+    Blynk.virtualWrite(V4, 0);
+    Blynk.virtualWrite(V7, 255);
+  } else {
+    Blynk.virtualWrite(V7, 0);
+    Blynk.virtualWrite(V4, 255);
+  }
+}
+
+// ================= WIFI CONNECT =================
+void connectToWiFi() {
+  Serial.print("🔌 Connecting to WiFi");
+  WiFi.begin(ssid, pass);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\n✅ WiFi Connected");
+    Serial.print("📡 IP: ");
+    Serial.println(WiFi.localIP());
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+    updateStatusLeds();
+  } else {
+    wifiConnected = false;
+    Serial.println("\n❌ WiFi Failed | Offline Mode");
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("\n================ SYSTEM START =================");
+
+  connectToWiFi();
+  dht.begin();
+
+  pinMode(MQ135_PIN, INPUT);
+  pinMode(MQ2_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Serial.println("🟢 System Ready | Monitoring Started\n");
+
+  updateStatusLeds();
+}
+
+// ================= BLYNK ACK BUTTON =================
+BLYNK_WRITE(V5) {
+  if (param.asInt() == 1 && alertActive) {
+
+    alertActive = false;
+    acknowledged = true;
+
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+
+    Serial.println("🛑 ALERT ACKNOWLEDGED");
+    Serial.println("⏳ Waiting for NORMAL readings before re-arming...");
+
+    updateCauseLabel("Acknowledged: " + lastAlertCause);
+    updateStatusLeds();
+    if (wifiConnected) {
+      Blynk.virtualWrite(V5, 0);
+    }
+  }
+}
+
+// ================= LOOP =================
+void loop() {
+
+  if (wifiConnected) Blynk.run();
+
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  int mq135 = analogRead(MQ135_PIN);
+  int mq2 = analogRead(MQ2_PIN);
+
+  // ---------- SERIAL OUTPUT ----------
+  Serial.println("------------------------------------------------");
+  Serial.println("📊 SENSOR READINGS");
+  Serial.print("🌡 Temperature : "); Serial.print(temp); Serial.println(" °C");
+  Serial.print("💧 Humidity    : "); Serial.print(hum); Serial.println(" %");
+  Serial.print("🫁 MQ135 (Air) : "); Serial.println(mq135);
+  Serial.print("🔥 MQ2 (Gas)   : "); Serial.println(mq2);
+
+  // ---------- SEND TO BLYNK ----------
+  if (wifiConnected) {
+    Blynk.virtualWrite(V0, temp);
+    Blynk.virtualWrite(V1, hum);
+    Blynk.virtualWrite(V2, mq135);
+    Blynk.virtualWrite(V3, mq2);
+  }
+
+  // ---------- CONDITIONS ----------
+  bool danger = (temp > TEMP_THRESHOLD || mq135 > MQ135_THRESHOLD || mq2 > MQ2_THRESHOLD);
+  bool normal = (temp <= TEMP_THRESHOLD && mq135 <= MQ135_THRESHOLD && mq2 <= MQ2_THRESHOLD);
+
+  // ---------- ALERT TRIGGER ----------
+  if (systemArmed && !alertActive && danger) {
+
+    if (temp > TEMP_THRESHOLD) cause = "High Temperature";
+    else if (mq135 > MQ135_THRESHOLD) cause = "Poor Air Quality";
+    else cause = "Gas Leakage";
+
+    lastAlertCause = cause;
+
+    alertActive = true;
+    systemArmed = false;   // 🔒 latch system
+
+    Serial.println("🚨🚨 ALERT TRIGGERED 🚨🚨");
+    Serial.println("⚠ Cause: " + cause);
+
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(BUZZER_PIN, HIGH);
+
+    updateCauseLabel(cause);
+    updateStatusLeds();
+    if (wifiConnected) {
+      Blynk.logEvent("alert", cause);
+    }
+  }
+
+  // ---------- RESET ONLY AFTER NORMAL ----------
+  if (!systemArmed && normal) {
+
+    alertActive = false;
+    acknowledged = false;
+    systemArmed = true;    // 🔓 re-arm system
+
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+
+    Serial.println("✅ Readings NORMAL");
+    Serial.println("🔄 System Re-Armed | Ready for next alert");
+
+    updateCauseLabel("Safe");
+    updateStatusLeds();
+  }
+
+  // ---------- KEEP LABEL IN SYNC DURING NORMAL ----------
+  if (normal && !alertActive && cause != "Safe") {
+    updateCauseLabel("Safe");
+    updateStatusLeds();
+  }
+
+  updateStatusLeds();
+
+  delay(2000);
+}
